@@ -181,8 +181,10 @@ class ServerArgs:
     eplb_algorithm: str = "auto"
     eplb_rebalance_num_iterations: int = 1000
     eplb_rebalance_layers_per_chunk: Optional[int] = None
+    eplb_window_size: int = 1000
+    eplb_priority_window_size: int = 100
     expert_distribution_recorder_mode: Optional[
-        Literal["stat", "per_pass", "per_token"]
+        Literal["stat", "per_pass", "per_token", "historical"]
     ] = None
     expert_distribution_recorder_buffer_size: Optional[int] = None
     enable_expert_distribution_metrics: bool = False
@@ -411,6 +413,19 @@ class ServerArgs:
                 self.expert_distribution_recorder_buffer_size = x
             elif self.expert_distribution_recorder_mode is not None:
                 self.expert_distribution_recorder_buffer_size = 1000
+
+        # EPLB sliding window mode size check
+        if self.enable_eplb:
+            assert self.eplb_window_size > 0, "EPLB window size must be greater than 0"
+            assert self.eplb_priority_window_size > 0, "EPLB priority window size must be greater than 0"
+            assert self.eplb_window_size >= self.eplb_rebalance_num_iterations, (
+                f"EPLB window size ({self.eplb_window_size}) must be greater than or equal to "
+                f"rebalance number iterations ({self.eplb_rebalance_num_iterations})"
+            )
+            assert self.eplb_priority_window_size <= self.eplb_rebalance_num_iterations, (
+                f"EPLB priority window size ({self.eplb_priority_window_size}) must be less than or equal to "
+                f"rebalance number iterations ({self.eplb_rebalance_num_iterations})"
+            )
 
         # Speculative Decoding
         if self.speculative_algorithm == "NEXTN":
@@ -1367,6 +1382,19 @@ class ServerArgs:
             type=int,
             default=ServerArgs.eplb_rebalance_num_iterations,
             help="Number of iterations to automatically trigger a EPLB re-balance.",
+        )
+        # EPLB sliding window args
+        parser.add_argument(
+            "--eplb-window-size",
+            type=int,
+            default=ServerArgs.eplb_window_size,
+            help="Total size of the sliding window for EPLB re-balance.",
+        )
+        parser.add_argument(
+            "--eplb-priority-window-size",
+            type=int,
+            default=ServerArgs.eplb_priority_window_size,
+            help="Priority window size in sliding window mode for EPLB re-balance.",
         )
         parser.add_argument(
             "--eplb-rebalance-layers-per-chunk",

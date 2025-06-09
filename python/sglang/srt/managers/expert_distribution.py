@@ -32,6 +32,14 @@ from sglang.srt.utils import Withable, get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
+# 添加控制台handler
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+
 # --------------------------------------- Entrypoint -----------------------------------------
 
 _OutputMode = Literal["file", "object"]
@@ -527,6 +535,7 @@ class _Accumulator(ABC):
             "stat": _StatAccumulator,
             "per_pass": _DetailAccumulator,
             "per_token": _DetailAccumulator,
+            "historical": _SlidingWindowAccumulator,
         }[server_args.expert_distribution_recorder_mode]
 
     def __init__(
@@ -565,6 +574,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         super().__init__(*args, **kwargs)
 
         self._enable = self._server_args.enable_expert_distribution_metrics
+        self._recorder_mode = self._server_args.expert_distribution_recorder_mode
 
         if self._enable:
             window_sizes = [10, 100, 1000]
@@ -585,7 +595,7 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
 
     def reset(self):
         super().reset()
-        if self._enable:
+        if self._enable and self._recorder_mode not in ["stat", "historical"]:
             self._history.clear()
 
     def _append_utilization_rate(
@@ -742,7 +752,65 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             return output
         else:
             raise NotImplementedError
+        
+class _SlidingWindowAccumulator(_UtilizationRateAccumulatorMixin):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._window_size = self._server_args.eplb_window_size
+        self._priority_window_size = self._server_args.eplb_priority_window_size
+        self._current_window_size = self._server_args.eplb_rebalance_num_iterations
+        self._global_physical_count_of_buffered_step = _Buffer.init_new_historical(
+            item_shape=(
+                self._expert_location_metadata.num_layers,
+                # Cannot use local_physical_count to support select_experts
+                self._expert_location_metadata.num_physical_experts,
+            ),
+            window_size=self._window_size,
+            dtype=torch.int32,
+            device=self._server_args.device,
+        )
 
+    def append(
+        self,
+        forward_pass_id: int,
+        gatherer_key: str,
+        single_pass_data: Dict,
+    ):
+        super().append(forward_pass_id, gatherer_key, single_pass_data)
+        # Can optimize if overhead here is large
+        self._global_physical_count_of_buffered_step.append(
+            single_pass_data["global_physical_count"]
+        )
+
+    def reset(self):
+        super().reset()
+        self._global_physical_count_of_buffered_step.reset()
+
+    def dump(self, output_mode: _OutputMode):
+        logical_count_of_buffered_step = _convert_global_physical_count_to_logical_count_historical(
+            self._global_physical_count_of_buffered_step.get_all(),
+            num_layers=self._expert_location_metadata.num_layers,
+            num_logical_experts=self._expert_location_metadata.num_logical_experts,
+            priority_window_size=self._priority_window_size,
+            current_window_size=self._current_window_size,
+            total_window_size=self._window_size,
+            physical_to_logical_map=self._expert_location_metadata.physical_to_logical_map,
+        )
+        torch.distributed.all_reduce(
+            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+        )
+        output = dict(
+            rank=self._rank,
+            logical_count=logical_count_of_buffered_step,
+        )
+
+        if output_mode == "file":
+            if self._rank == 0:
+                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
+        elif output_mode == "object":
+            return output
+        else:
+            raise NotImplementedError
 
 def _dump_to_file(name, data):
     save_dir = Path(os.environ.get("SGLANG_EXPERT_DISTRIBUTION_RECORDER_DIR", "/tmp"))
@@ -760,6 +828,13 @@ class _Buffer:
             return _InfiniteBuffer(item_shape, dtype=dtype, device=device)
         else:
             return _CircularBuffer(item_shape, buffer_size, dtype=dtype, device=device)
+        
+    @staticmethod
+    def init_new_historical(item_shape: Tuple, window_size: int, dtype, device):
+        if window_size < 0:
+            return _InfiniteBuffer(item_shape, dtype=dtype, device=device)
+        else:
+            return _DequeBuffer(item_shape, window_size, dtype=dtype, device=device)
 
     def append(self, value: torch.Tensor):
         raise NotImplementedError
@@ -817,6 +892,39 @@ class _InfiniteBuffer(_Buffer):
         self._buffer[...] = 0
         self._size = 0
 
+class _DequeBuffer(_Buffer):
+    def __init__(self, item_shape: Tuple, buffer_size: int, dtype, device):
+        # 使用deque作为基础数据结构,实现FIFO
+        self._buffer_size = buffer_size
+        self._device = device
+        self._dtype = dtype
+        self._item_shape = item_shape
+        # 初始化一个空的deque
+        self._deque = deque(maxlen=buffer_size)
+
+    def append(self, value: torch.Tensor):
+        # 如果deque达到最大长度,会自动从左侧(最早的数据)移除
+        self._deque.append(value.clone())
+
+    def get_all(self) -> torch.Tensor:
+        if not self._deque: # 如果deque为空
+            return torch.zeros((self._buffer_size, *self._item_shape), 
+                            dtype=self._dtype, device=self._device)
+        
+        # 将deque中的所有tensor堆叠成一个tensor
+        tensor_list = list(self._deque)
+        actual_size = len(tensor_list)
+        
+        # 如果deque还未填满,需要填充零tensor
+        result = torch.zeros((self._buffer_size, *self._item_shape), 
+                           dtype=self._dtype, device=self._device)
+        result[-actual_size:] = torch.stack(tensor_list)
+        return result
+
+    def reset(self):
+        # self._deque.clear() # 清空deque
+        pass
+
 
 def _convert_global_physical_count_to_logical_count(
     # (whatever, num_layers, num_physical_experts)
@@ -839,6 +947,63 @@ def _convert_global_physical_count_to_logical_count(
         src=global_physical_count,
     )
     return logical_count
+
+
+def _convert_global_physical_count_to_logical_count_historical(
+    global_physical_count: torch.Tensor,
+    num_layers: int,
+    num_logical_experts: int,
+    priority_window_size: int,
+    current_window_size: int,
+    total_window_size: int,
+    physical_to_logical_map: torch.Tensor,
+):
+    """Convert global physical count to logical count for historical data with weight.
+    
+    Args:
+        global_physical_count: Input tensor with shape (window_size, num_layers, num_physical_experts)
+        priority_window_size: Size of the highest priority window (most recent)
+        current_window_size: Size of the current window (includes priority window)
+        total_window_size: Total size of buffer window
+        
+    The function applies different weights to different time windows:
+    - Recent (priority) window: highest weight (1.0)
+    - Current window (excluding priority): medium weight (0.5)
+    - Historical window: lowest weight (0.1)
+    """
+    dim_extra, num_layer, num_physical_expert = global_physical_count.shape
+    assert dim_extra == total_window_size, (
+        f"Expected eplb_window_buffer_size to be same as {total_window_size}, but got {dim_extra}"
+    )
+    dtype = global_physical_count.dtype
+    device = global_physical_count.device
+    
+    # Create weight tensor
+    weights = torch.ones(dim_extra, dtype=dtype, device=device) * 0.2  # default weight for historical data
+    if current_window_size > 0:
+        weights[-current_window_size:] = 0.8  # medium weight for current window
+    if priority_window_size > 0:
+        weights[-priority_window_size:] = 1.0  # highest weight for priority window
+        
+    # Apply weights to input tensor
+    weighted_physical_count = global_physical_count * weights.view(-1, 1, 1)
+    
+    # Convert to logical experts count with weights
+    # Ensure weighted_physical_count has the correct dtype
+    weighted_physical_count = weighted_physical_count.to(dtype)
+    
+    logical_count_historical = torch.zeros(
+        (dim_extra, num_layers, num_logical_experts), dtype=dtype, device=device
+    )
+    logical_count_historical.scatter_add_(
+        dim=2,
+        index=physical_to_logical_map.unsqueeze(0)
+        .expand(dim_extra, -1, -1)
+        .to(torch.int64),
+        src=weighted_physical_count,
+    )
+    
+    return logical_count_historical
 
 
 def compute_gpu_physical_count(
